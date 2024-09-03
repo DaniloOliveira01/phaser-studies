@@ -1,0 +1,170 @@
+name: Production
+on:
+  push:
+    branches: [main]
+env:
+  KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA_PROD }}
+  KUBE_NAMESPACE: ${{ secrets.KUBE_NAMESPACE }}
+  AWS_HOST: ${{ secrets.AWS_SUB_DOMAIN }}.sistemasinteegra.com.br
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_HOSTED_ZONE_ID: ${{ secrets.AWS_HOSTED_ZONE_ID_PROD}}
+  AWS_CNAME: ${{ secrets.AWS_CNAME_PROD}}
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_DEFAULT_OUTPUT: json
+  OPEN_VPN_AUTH: ${{ secrets.OPEN_VPN_AUTH }}
+  OPEN_VPN_CONFIG: ${{ secrets.OPEN_VPN_CONFIG }}
+  OPEN_VPN_KEY: ${{ secrets.OPEN_VPN_KEY }}
+  OPEN_VPN_CRT: ${{ secrets.OPEN_VPN_CRT }}
+  INGRESS_ISSUER: prod
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set repository & deployment
+        run: |
+          repo=$(echo ${{ github.repository }} | cut -d'/' -f2)          
+          echo "AWS_REPOSITORY=$repo" >> $GITHUB_ENV
+          echo "KUBE_DEPLOYMENT=$repo" >> $GITHUB_ENV       
+      - name: Set current branch
+        run: |
+          branch_name=$(echo ${GITHUB_REF#refs/heads/})
+          echo "BRANCH_NAME=$branch_name" >> $GITHUB_ENV
+      - name: Current branch
+        run: |
+          echo "${{ env.BRANCH_NAME }}"
+      - name: Checkout current branch
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+      - name: Set docker image tag
+        run: |
+          echo "DOCKER_TAG_IMAGE=${AWS_REPOSITORY}:ga-${{ github.run_number }}" >> $GITHUB_ENV
+      - name: Setup ECR
+        run: |
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - name: Build docker image
+        run: |
+          docker build \
+            -t ${DOCKER_TAG_IMAGE} \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${DOCKER_TAG_IMAGE} ./
+      - name: Check if ECR repository exists
+        run: |
+          exists=$(aws ecr describe-repositories --repository-names "$AWS_REPOSITORY" 2>&1 || true)
+          if [[ "$exists" == *"RepositoryNotFoundException"* ]]; then
+            echo "repository_exists=false" >> $GITHUB_ENV
+          else
+            echo "repository_exists=true" >> $GITHUB_ENV
+          fi
+      - name: Create ECR repository if not exists
+        if: env.repository_exists != 'true'
+        run: |
+          aws ecr create-repository --repository-name "$AWS_REPOSITORY"
+      - name: Push docker image to AWS ECR
+        run: |
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${DOCKER_TAG_IMAGE}
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Set repository & deployment
+        run: |
+          repo=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          echo "AWS_REPOSITORY=$repo" >> $GITHUB_ENV
+          echo "KUBE_DEPLOYMENT=$repo" >> $GITHUB_ENV    
+      - name: Update Ubuntu
+        run: |
+          sudo apt-get update -y
+      - name: Install openvpn
+        run: |
+          sudo apt-get install -y openvpn
+      - name: Set Open VPN auth file
+        run: |
+          sudo bash -c "echo '${OPEN_VPN_AUTH}' | base64 --decode  >> auth.txt"
+      - name: Set Open VPN config file
+        run: |
+          sudo bash -c "echo '${OPEN_VPN_CONFIG}' >> config.ovpn"
+      - name: Set Open VPN key file
+        run: |
+          sudo bash -c "echo '${OPEN_VPN_KEY}' >> vpn-UDP4-1195-tls.key"
+      - name: Set Open VPN crt file
+        run: |
+          sudo bash -c "echo '${OPEN_VPN_CRT}' >> vpn-UDP4-1195-ca.crt"
+      - name: Connect to Open VPN
+        run: |
+          sudo openvpn --config config.ovpn --auth-user-pass auth.txt & sleep 5
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      - name: Ensure .kube directory exists
+        run: sudo mkdir -p /root/.kube
+      - name: Configure kubectl
+        run: |
+          sudo bash -c "echo '${KUBE_CONFIG_DATA}' | base64 --decode  >> ~/.kube/config"
+      - name: Check kubectl connection
+        run: |
+          sudo kubectl cluster-info
+      - name: Set current branch
+        run: |
+          branch_name=$(echo ${GITHUB_REF#refs/heads/})
+          echo "BRANCH_NAME=$branch_name" >> $GITHUB_ENV
+      - name: Current branch
+        run: |
+          echo "${{ env.BRANCH_NAME }}"
+      - name: Checkout current branch
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+      - name: Host sub domain
+        run: sudo bash .github/scripts/01_route53.sh ${{ env.AWS_ACCESS_KEY_ID }} ${{ env.AWS_SECRET_ACCESS_KEY }} ${{ env.AWS_HOSTED_ZONE_ID }} ${{ env.AWS_HOST }} ${{ env.AWS_CNAME }}
+      - name: Check if deployment exists
+        run: |
+          deployment=$(sudo kubectl get deployment ${{ env.KUBE_DEPLOYMENT }} -n ${{ env.KUBE_NAMESPACE }} 2>&1 || true)
+          if [[ "$deployment" == *"NotFound"* ]]; then
+            echo "deployment_exists=false" >> $GITHUB_ENV
+          else
+            echo "deployment_exists=true" >> $GITHUB_ENV
+          fi
+      - name: Apply service if does not exist
+        if: env.deployment_exists == 'false'
+        run: sudo bash .github/scripts/02_deployment.sh ${{ env.KUBE_NAMESPACE }} ${{ env.KUBE_DEPLOYMENT }}
+      - name: Check if service exists
+        run: |
+          service=$(sudo kubectl get service svc-${{ env.KUBE_DEPLOYMENT }} -n ${{ env.KUBE_NAMESPACE }} 2>&1 || true)
+          if [[ "$service" == *"NotFound"* ]]; then
+            echo "service_exists=false" >> $GITHUB_ENV
+          else
+            echo "service_exists=true" >> $GITHUB_ENV
+          fi
+      - name: Apply service if does not exist
+        if: env.service_exists == 'false'
+        run: |
+          sudo bash .github/scripts/03_service.sh ${{ env.KUBE_NAMESPACE }} ${{ env.KUBE_DEPLOYMENT }}
+      - name: Check if ingress exists
+        run: |
+          ingress=$(sudo kubectl get ingress ingress-${{ env.KUBE_DEPLOYMENT }} -n ${{ env.KUBE_NAMESPACE }} 2>&1 || true)
+          if [[ "$ingress" == *"NotFound"* ]]; then
+            echo "ingress_exists=false" >> $GITHUB_ENV
+          else
+            echo "ingress_exists=true" >> $GITHUB_ENV
+          fi
+      - name: Apply ingress if does not exist
+        if: env.ingress_exists == 'false'
+        run: |
+          sudo bash .github/scripts/04_ingress.sh ${{ env.KUBE_NAMESPACE }} ${{ env.KUBE_DEPLOYMENT }} ${{ env.INGRESS_ISSUER }} ${{ env.AWS_HOST }}
+      - name: Set tag image
+        run: |
+          echo "DOCKER_TAG_IMAGE=${AWS_REPOSITORY}:ga-${{ github.run_number }}" >> $GITHUB_ENV
+      - name: Update Kubernetes Deployment
+        run: |
+          sudo kubectl set image deployment/"${KUBE_DEPLOYMENT}" "${KUBE_DEPLOYMENT}"="${AWS_ACCOUNT_ID}".dkr.ecr."${AWS_DEFAULT_REGION}".amazonaws.com/"${DOCKER_TAG_IMAGE}" -n "${KUBE_NAMESPACE}"
+      - name: Deployment current image
+        run: |
+          sudo kubectl get deployment "${KUBE_DEPLOYMENT}" -n "${KUBE_NAMESPACE}" -o=jsonpath='{.spec.template.spec.containers[0].image}'
+      - name: Deployment rollout status
+        run: |
+          sudo kubectl rollout status deployment "${KUBE_DEPLOYMENT}" -n "${KUBE_NAMESPACE}"
